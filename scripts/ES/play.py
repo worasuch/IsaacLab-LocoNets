@@ -1,0 +1,209 @@
+import argparse
+import sys
+
+from isaaclab.app import AppLauncher
+from tqdm import tqdm
+
+# add argparse arguments
+parser = argparse.ArgumentParser(description="Train an RL agent with RL-Games.")
+parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
+parser.add_argument("--video_length", type=int, default=500, help="Length of the recorded video (in steps).")
+parser.add_argument("--video_interval", type=int, default=2500, help="Interval between video recordings (in steps).")
+parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
+parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+parser.add_argument("--seed", type=int, default=42, help="Seed used for the environment")
+parser.add_argument("--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes.")
+
+group = parser.add_mutually_exclusive_group(required=False)
+# Write on "model" argument to select the model type
+group.add_argument("--hebb", dest="model", action="store_const", const="hebb", help="Use Hebbian network")
+group.add_argument("--lstm", dest="model", action="store_const", const="lstm", help="Use LSTM network")
+group.add_argument( "--ff", dest="model", action="store_const", const="ff", help="Use Feed-Forward network")
+group.add_argument( "--cpg_rbf", dest="model", action="store_const", const="cpg_rbf", help="Use CPG_RBF network")
+
+# Add Checkpoint argument
+parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
+parser.add_argument("--experiment", type=str, default=None, help="experiment name.")
+
+parser.add_argument("--sigma", type=str, default=None, help="The policy's initial standard deviation.")
+parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+
+parser.add_argument(
+    "--wandb",
+    action="store_true",
+    default=False,
+    help="when given, log in wandb"
+)
+
+
+# append AppLauncher cli args
+AppLauncher.add_app_launcher_args(parser)
+# parse the arguments
+args_cli, hydra_args = parser.parse_known_args()
+# always enable cameras to record video
+if args_cli.video:
+    args_cli.enable_cameras = True
+
+# clear out sys.argv for Hydra
+sys.argv = [sys.argv[0]] + hydra_args
+
+# launch omniverse app
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+import gymnasium as gym
+import math
+import os
+import random
+from datetime import datetime
+import pickle
+
+from rl_games.common import env_configurations, vecenv
+from rl_games.common.algo_observer import IsaacAlgoObserver
+from rl_games.torch_runner import Runner
+
+from isaaclab.envs import DirectRLEnvCfg
+from isaaclab.utils.assets import retrieve_file_path
+from isaaclab.utils.dict import print_dict
+from isaaclab.utils.io.yaml import dump_yaml
+
+import isaaclab_tasks  # noqa: F401
+from isaaclab_tasks.utils.hydra import hydra_task_config
+import IsaacLabLocoNets.tasks.slalom.slalom_env
+
+from utils.ES_classes import *
+from utils.feedforward_neural_net_gpu import *
+from utils.hebbian_neural_net import *
+from utils.LSTM_neural_net import * 
+from utils.CPG_RBF import *
+from utils.ES_agent import *
+
+
+def dump_pickle(filename, data):
+    if not filename.endswith(".pkl"):
+        filename += ".pkl"
+    dirpath = os.path.dirname(filename)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
+    with open(filename, "wb") as f:
+        pickle.dump(data, f)
+
+
+@hydra_task_config(args_cli.task, "es_cfg_entry_point")
+def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
+    """Train with ES agent."""
+    # --------------------------------- Setting up Agent --------------------------------- #
+    # Initialize env device and number of environments
+    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    # Initialize ES Model
+    agent_cfg["model"] = args_cli.model if args_cli.model is not None else agent_cfg["model"]
+    print(f"Using model: {agent_cfg['model']}")
+    # Initialize ES parameters
+    agent_cfg["ES_params"]["POPSIZE"] = args_cli.num_envs if args_cli.num_envs is not None else agent_cfg["ES_params"]["POPSIZE"]
+    agent_cfg["USE_TRAIN_PARAM"] = True
+    agent_cfg["test"] = True
+
+    # Normally False (not Log)
+    agent_cfg["wandb"]["wandb_activate"] = args_cli.wandb
+    if args_cli.seed == -1:
+        args_cli.seed = random.randint(0, 10000)
+    # Set seed
+    agent_cfg["seed"] = args_cli.seed if args_cli.seed is not None else agent_cfg["seed"]
+    # Set Epochs (max number of episodes/iterations)
+    agent_cfg["EPOCHS"] = (
+        args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg["EPOCHS"]
+    )
+    
+    # Set Task name
+    agent_cfg["task_name"] = args_cli.task if args_cli.task is not None else agent_cfg["task_name"]
+    agent_cfg["num_envs"] = args_cli.num_envs if args_cli.num_envs is not None else agent_cfg["num_envs"]
+    
+    # Set checkpoint path
+    if args_cli.checkpoint is not None:
+        if args_cli.model == "hebb":
+            agent_cfg["train_hebb_path"] = args_cli.checkpoint
+            load_path = agent_cfg["train_hebb_path"]
+        elif args_cli.model == "lstm":
+            agent_cfg["train_lstm_path"] = args_cli.checkpoint
+            load_path = agent_cfg["train_lstm_path"]
+        elif args_cli.model == "ff":
+            agent_cfg["train_ff_path"] = args_cli.checkpoint
+            load_path = agent_cfg["train_ff_path"]
+        elif args_cli.model == "cpg_rbf":
+            print(" CPG_RBF model selected, loading checkpoint...")
+            agent_cfg["train_cpg_rbf_path"] = args_cli.checkpoint
+            load_path = agent_cfg["train_cpg_rbf_path"]
+    elif args_cli.checkpoint is None:
+        if args_cli.model == "hebb":
+            load_path = agent_cfg["train_hebb_path"]
+        elif args_cli.model == "lstm":
+            load_path = agent_cfg["train_lstm_path"]
+        elif args_cli.model == "ff":
+            load_path = agent_cfg["train_ff_path"]
+        elif args_cli.model == "cpg_rbf":
+            load_path = agent_cfg["train_cpg_rbf_path"]
+
+        
+        print(args_cli.model, args_cli.experiment)
+
+        print(f"[INFO]: Loading model checkpoint from: {args_cli.model}+{args_cli.experiment}+{load_path}")
+    train_sigma = float(args_cli.sigma) if args_cli.sigma is not None else None
+
+    # multi-gpu training config
+    if args_cli.distributed:
+        agent_cfg["params"]["seed"] += app_launcher.global_rank
+        agent_cfg["params"]["config"]["device"] = f"cuda:{app_launcher.local_rank}"
+        agent_cfg["device_name"] = f"cuda:{app_launcher.local_rank}"
+        agent_cfg["multi_gpu"] = True
+        # update env config device
+        env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
+    
+    # set the environment seed (after multi-gpu config for updated rank from agent seed)
+    # note: certain randomizations occur in the environment initialization so we set the seed here
+    env_cfg.seed = agent_cfg["seed"]
+
+
+    # specify directory for logging experiments
+    # log_root_path = os.path.join("run_ES", agent_cfg["task_name"], args_cli.checkpoint)
+    log_root_path = os.path.join("logs", "es", agent_cfg["task_name"] , agent_cfg["model"])
+    log_root_path = os.path.abspath(log_root_path)
+    print(f"[INFO] Logging experiment in directory: {log_root_path}")
+
+    if args_cli.experiment is None:
+    # log_dir = agent_cfg.get("experiment", None)
+    # if not log_dir:
+        agent_cfg["experiment"] = agent_cfg["experiment"]
+    else:
+        agent_cfg["experiment"] = args_cli.experiment
+        log_dir = args_cli.experiment
+
+
+    # create isaac environment
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+        
+    # wrap for video recording
+    if args_cli.video:
+        video_kwargs = {
+            "video_folder": os.path.join(log_root_path, log_dir, "videos", "play"),
+            "step_trigger": lambda step: step % args_cli.video_interval == 0,
+            "video_length": args_cli.video_length,
+            "disable_logger": True,
+        }
+        print("[INFO] Recording videos during training.")
+        print_dict(video_kwargs, nesting=4)
+        env = gym.wrappers.RecordVideo(env, **video_kwargs)
+        
+    
+    agent = ESAgent(agent_cfg)
+    
+    while simulation_app.is_running():
+        agent.run(env=env, test=True)
+    env.close()
+
+if __name__ == "__main__":
+    # run the main function
+    main()
+    # close sim app
+    simulation_app.close()
