@@ -4,7 +4,7 @@ This repository provides a simple framework for training robots using CPGRBF net
 
 
 ## Installation
-Tested Env: Ubuntu 22.04, IsaacSim 5.1
+Tested: Ubuntu 22.04, IsaacSim 5.1
 
 - Install Isaac Lab by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html). We recommend using the conda installation as it simplifies calling Python scripts from the terminal.
 
